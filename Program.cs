@@ -1,188 +1,309 @@
 ﻿using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 
-namespace third_dz
+namespace chetv_dz
 {
     class Program
     {
-        private const int MaxHp = 100;
-        private const int PlayerStrength = 5;
+        private const string LogFilePath = "battle.log";
+        private const string SaveFilePath = "GameSaveFile.dat";
 
-        private static int _playerHp = MaxHp;
-        private static int _enemyHp = MaxHp;
-        private static int _round = 1;
+        private static BattleStats _stats;
+        private static ILogger _logger;
+        private static GameClock _clock;
+        private static RandomEventGenerator _eventGenerator;
+        private static SaveManager _saveManager;
+        private static bool _isRunning = true;
 
-        private static IEnemyAttackStrategy _enemyStrategy;
-        private static bool _hasSwitchedToCareful = false;
-        private static bool _hasSwitchedToRandom = false;
+        private static bool _isCasting = false;
+        private static CancellationTokenSource _castCts;
 
-        private static readonly LightPlayerAttackStrategy _lightStrategy = new LightPlayerAttackStrategy();
-        private static readonly HeavyPlayerAttackStrategy _heavyStrategy = new HeavyPlayerAttackStrategy(12, PlayerStrength, 2);
-
-        private static readonly PlayerDamagePipeline _pipeline = new PlayerDamagePipeline();
-
-        static void Main(string[] args)
+        static async Task Main(string[] args)
         {
-            _pipeline.Modifiers += PlayerDamagePipeline.ApplyBonusIfEnemyLow;
-            _pipeline.Modifiers += PlayerDamagePipeline.ApplyPenaltyIfPlayerLow;
+            Console.OutputEncoding = System.Text.Encoding.UTF8;
 
-            _enemyStrategy = new AggressiveEnemyStrategy();
+            bool startNew = await HandleStartupAsync();
 
-            bool exit = false;
+            if (!startNew)
+                return;
 
-            while (!exit)
-            {
-                DisplayStateAndMenu();
-
-                int choice = ReadIntInput(0, 4, "Ваш выбор: ");
-
-                if (choice == 0)
-                {
-                    exit = true;
-                    continue;
-                }
-
-                if (choice == 4)
-                {
-                    ShowStateOnly();
-                    continue;
-                }
-
-                bool playerAlive = ProcessPlayerTurn(choice);
-                if (!playerAlive) break;
-
-                if (_enemyHp <= 0)
-                {
-                    Console.WriteLine("\nПоздравляем! Вы победили!\n");
-                    break;
-                }
-
-                UpdateEnemyStrategy();
-
-                bool enemyAlive = ProcessEnemyTurn();
-                if (!enemyAlive) break;
-
-                if (_playerHp <= 0)
-                {
-                    Console.WriteLine("\nПротивник победил! Game over.\n");
-                    break;
-                }
-
-                _round++;
-            }
-
-            Console.WriteLine("Игра завершена. Нажмите любую клавишу для выхода...");
-            Console.ReadKey();
+            await RunGameLoopAsync();
         }
 
-        private static void DisplayStateAndMenu()
+        private static async Task<bool> HandleStartupAsync()
         {
-            string strategyName = GetEnemyStrategyName();
-            Console.WriteLine($"\n--- Раунд {_round} | Игрок {_playerHp} HP | Сила {PlayerStrength} | Противник {_enemyHp} HP | Стратегия: {strategyName} ---");
-            Console.WriteLine("1 - Лёгкий удар");
-            Console.WriteLine("2 - Тяжёлый удар");
-            Console.WriteLine("3 - Отдых");
-            Console.WriteLine("4 - Показать состояние");
-            Console.WriteLine("0 - Выход");
-        }
+            bool logExists = File.Exists(LogFilePath);
+            bool saveExists = File.Exists(SaveFilePath);
 
-        private static void ShowStateOnly()
-        {
-            string strategyName = GetEnemyStrategyName();
-            Console.WriteLine($"Игрок: {_playerHp} HP | Противник: {_enemyHp} HP | Сила: {PlayerStrength} | Раунд: {_round} | Стратегия: {strategyName}");
-        }
-
-        private static bool ProcessPlayerTurn(int choice)
-        {
-            int damage = 0;
-            string attackType = "";
-
-            if (choice == 1)
+            if (!logExists && !saveExists)
             {
-                damage = _lightStrategy.GetPlayerDamage(_round, _playerHp, _enemyHp);
-                attackType = "лёгкий удар";
-            }
-            else if (choice == 2)
-            {
-                damage = _heavyStrategy.GetPlayerDamage(_round, _playerHp, _enemyHp);
-                attackType = $"тяжёлый удар (база 12 + Сила×2 = {damage})";
-            }
-            else if (choice == 3)
-            {
-                _playerHp += 5;
-                if (_playerHp > MaxHp)
-                    _playerHp = MaxHp;
-                Console.WriteLine("Игрок отдыхает и восстанавливает 5 HP.");
+                await StartNewGameAsync();
                 return true;
             }
 
-            if (choice == 1 || choice == 2)
+            Console.WriteLine("Файл сохранения найден.");
+            Console.WriteLine("1 - Начать заново");
+            Console.WriteLine("2 - Продолжить");
+            Console.Write("Ваш выбор: ");
+
+            string choice = Console.ReadLine();
+
+            if (choice == "1")
             {
-                int enemyHpBefore = _enemyHp;
-                DamageContext context = new DamageContext(_round, enemyHpBefore, _playerHp, PlayerStrength);
-                _pipeline.Apply(ref damage, context);
+                await StartNewGameAsync();
+                return true;
+            }
+            else if (choice == "2")
+            {
+                await ContinueGameAsync();
+                return true;
+            }
+            else
+            {
+                Console.WriteLine("Неверный ввод. Выход.");
+                return false;
+            }
+        }
 
-                _enemyHp -= damage;
-                if (_enemyHp < 0) _enemyHp = 0;
+        private static async Task StartNewGameAsync()
+        {
+            if (File.Exists(LogFilePath))
+                File.Delete(LogFilePath);
+            if (File.Exists(SaveFilePath))
+                File.Delete(SaveFilePath);
 
-                Console.WriteLine($"Игрок наносит {attackType}.");
+            _stats = new BattleStats();
+            _logger = new FileLogger(LogFilePath);
+            _clock = new GameClock(_stats);
+            _saveManager = new SaveManager(SaveFilePath);
 
-                if (context.EnemyHpBeforeHit < 30 || context.PlayerHp < 40)
+            _eventGenerator = new RandomEventGenerator(_stats, _logger);
+            _eventGenerator.OnEventOccurred += (msg) => Console.WriteLine($"\n[Событие] {msg}");
+            _eventGenerator.OnRageEvent += () =>
+            {
+                if (_isCasting && _castCts != null)
                 {
-                    Console.WriteLine($"  (После модификаторов урон составил {damage})");
+                    _castCts.Cancel();
+                }
+            };
+
+            _clock.Start();
+            _eventGenerator.Start();
+
+            await _logger.LogAsync("GAME_START");
+            await _saveManager.SaveAsync(_stats);
+
+            Console.WriteLine("Новая игра начата!");
+        }
+
+        private static async Task ContinueGameAsync()
+        {
+            _logger = new FileLogger(LogFilePath);
+            _saveManager = new SaveManager(SaveFilePath);
+
+            var save = await _saveManager.LoadAsync();
+            if (save == null)
+            {
+                Console.WriteLine("Ошибка загрузки сохранения. Начинаем новую игру.");
+                await StartNewGameAsync();
+                return;
+            }
+
+            _stats = new BattleStats();
+            save.ApplyTo(_stats);
+
+            _clock = new GameClock(_stats);
+            _eventGenerator = new RandomEventGenerator(_stats, _logger);
+            _eventGenerator.OnEventOccurred += (msg) => Console.WriteLine($"\n[Событие] {msg}");
+            _eventGenerator.OnRageEvent += () =>
+            {
+                if (_isCasting && _castCts != null)
+                {
+                    _castCts.Cancel();
+                }
+            };
+
+            _clock.Start();
+            _eventGenerator.Start();
+
+            var counters = await _logger.GetHistoryCountersAsync();
+            Console.WriteLine($"\nИстория: {counters}\n");
+
+            Console.WriteLine("Игра продолжена!");
+        }
+
+        private static async Task RunGameLoopAsync()
+        {
+            while (_isRunning && _stats.PlayerHP > 0 && _stats.EnemyHP > 0)
+            {
+                Console.WriteLine($"\n[HP: {_stats.PlayerHP}/100 | Противник: {_stats.EnemyHP}/300 | Тик: {_stats.Tick}]");
+                Console.WriteLine("Доступные команды: attack, heal, stats, log, exit" + (!_isCasting ? ", cast" : ""));
+                Console.Write("> ");
+
+                string input = Console.ReadLine()?.Trim().ToLower();
+
+                switch (input)
+                {
+                    case "attack":
+                        await AttackAsync();
+                        break;
+                    case "heal":
+                        await HealAsync();
+                        break;
+                    case "cast":
+                        if (!_isCasting)
+                            await CastAsync();
+                        else
+                            Console.WriteLine("Уже выполняется каст!");
+                        break;
+                    case "stats":
+                        ShowStats();
+                        break;
+                    case "log":
+                        await ShowLogAsync();
+                        break;
+                    case "exit":
+                        await ExitGameAsync();
+                        break;
+                    default:
+                        Console.WriteLine("Неизвестная команда.");
+                        break;
+                }
+
+                await _saveManager.SaveAsync(_stats);
+
+                if (_stats.EnemyHP <= 0)
+                {
+                    await EndGameAsync("Игрок");
+                    return;
+                }
+                if (_stats.PlayerHP <= 0)
+                {
+                    await EndGameAsync("Противник");
+                    return;
                 }
             }
-
-            return true;
         }
 
-        private static bool ProcessEnemyTurn()
+        private static async Task AttackAsync()
         {
-            int damage = _enemyStrategy.GetEnemyDamage(_round, _enemyHp, _playerHp);
-            _playerHp -= damage;
-            if (_playerHp < 0) _playerHp = 0;
+            Random rand = new Random();
+            int damage = rand.Next(8, 16);
+            _stats.EnemyHP -= damage;
+            if (_stats.EnemyHP < 0) _stats.EnemyHP = 0;
 
-            Console.WriteLine($"Противник наносит {damage} урона.");
-            return true;
+            await _logger.LogAsync("ATTACK", ("dmg", damage), ("enemyHP", _stats.EnemyHP), ("playerHP", _stats.PlayerHP));
+            Console.WriteLine($"⚔️ Вы нанесли {damage} урона противнику!");
         }
 
-        private static void UpdateEnemyStrategy()
+        private static async Task HealAsync()
         {
-            if (!_hasSwitchedToRandom && _enemyHp < 25)
+            Random rand = new Random();
+            int heal = rand.Next(5, 13);
+            _stats.PlayerHP += heal;
+            if (_stats.PlayerHP > 100) _stats.PlayerHP = 100;
+
+            await _logger.LogAsync("HEAL", ("value", heal), ("playerHP", _stats.PlayerHP));
+            Console.WriteLine($"💚 Вы восстановили {heal} HP!");
+        }
+
+        private static async Task CastAsync()
+        {
+            _isCasting = true;
+            _castCts = new CancellationTokenSource();
+
+            await _logger.LogAsync("CAST_START", ("durationMs", 3000));
+
+            Console.WriteLine("🔮 Начинается каст заклинания! 3 секунды...");
+
+            try
             {
-                _enemyStrategy = new RandomEnemyStrategy();
-                _hasSwitchedToRandom = true;
-                _hasSwitchedToCareful = true; 
-                Console.WriteLine("  (Противник меняет стратегию на Random!)");
+                for (int i = 0; i < 3; i++)
+                {
+                    await Task.Delay(1000, _castCts.Token);
+                    if (_castCts.Token.IsCancellationRequested)
+                        throw new OperationCanceledException();
+                    Console.Write(".");
+                }
+                Console.WriteLine();
+
+                Random rand = new Random();
+                int bonusDamage = rand.Next(20, 36);
+                _stats.EnemyHP -= bonusDamage;
+                if (_stats.EnemyHP < 0) _stats.EnemyHP = 0;
+
+                await _logger.LogAsync("CAST_SUCCESS", ("bonusDmg", bonusDamage), ("enemyHP", _stats.EnemyHP));
+                Console.WriteLine($"✨ Каст завершён! Нанесено {bonusDamage} урона заклинанием!");
             }
-            else if (!_hasSwitchedToCareful && _enemyHp < 50)
+            catch (OperationCanceledException)
             {
-                _enemyStrategy = new CarefulEnemyStrategy();
-                _hasSwitchedToCareful = true;
-                Console.WriteLine("  (Противник меняет стратегию на Careful!)");
+                Console.WriteLine("\n❌ Каст прерван из-за события «Ярость врага»!");
+                await _logger.LogAsync("CAST_CANCELLED", ("reason", "rage"));
+            }
+            finally
+            {
+                _isCasting = false;
+                _castCts.Dispose();
+                _castCts = null;
             }
         }
 
-        private static string GetEnemyStrategyName()
+        private static void ShowStats()
         {
-            if (_enemyStrategy is AggressiveEnemyStrategy)
-                return "Aggressive";
-            if (_enemyStrategy is CarefulEnemyStrategy)
-                return "Careful";
-            if (_enemyStrategy is RandomEnemyStrategy)
-                return "Random";
-            return "Unknown";
+            Console.WriteLine($"\n📊 СТАТИСТИКА:");
+            Console.WriteLine($"   Игрок: {_stats.PlayerHP}/100 HP");
+            Console.WriteLine($"   Противник: {_stats.EnemyHP}/300 HP");
+            Console.WriteLine($"   Тик: {_stats.Tick}");
         }
 
-        private static int ReadIntInput(int min, int max, string prompt)
+        private static async Task ShowLogAsync()
         {
-            while (true)
+            var lines = await _logger.GetLastLinesAsync(10);
+            Console.WriteLine("\n📋 Последние 10 строк лога:");
+            if (lines.Length == 0)
             {
-                Console.Write(prompt);
-                string input = Console.ReadLine();
-                if (int.TryParse(input, out int result) && result >= min && result <= max)
-                    return result;
-                Console.WriteLine("Неверный ввод");
+                Console.WriteLine("   (лог пуст)");
             }
+            else
+            {
+                foreach (var line in lines)
+                {
+                    Console.WriteLine($"   {line}");
+                }
+            }
+        }
+
+        private static async Task ExitGameAsync()
+        {
+            Console.WriteLine("Завершение игры...");
+            await _clock.StopAsync();
+            if (_eventGenerator != null)
+                await _eventGenerator.StopAsync();
+            _logger.Shutdown();
+            _isRunning = false;
+        }
+
+        private static async Task EndGameAsync(string winner)
+        {
+            Console.WriteLine($"\n🏆 Бой закончен. Победил: {winner}");
+
+            var counters = await _logger.GetHistoryCountersAsync();
+            Console.WriteLine($"\nИстория: {counters}");
+
+            await _clock.StopAsync();
+            if (_eventGenerator != null)
+                await _eventGenerator.StopAsync();
+            _logger.Shutdown();
+
+            if (File.Exists(LogFilePath))
+                File.Delete(LogFilePath);
+            _saveManager.DeleteSave();
+
+            Console.WriteLine("Файлы лога и сохранения удалены. Нажмите любую клавишу для выхода...");
+            Console.ReadKey();
+            Environment.Exit(0);
         }
     }
 }
