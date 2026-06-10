@@ -1,144 +1,179 @@
-﻿using second_dz;
-using System;
-using System.Collections.Generic;
+﻿using System;
 
-namespace second_dz
+namespace third_dz
 {
     class Program
     {
-        private const int SLOT_COUNT = 5;
+        private const int MaxHp = 100;
+        private const int PlayerStrength = 5;
 
-        private static Shelf shelfA = new Shelf("A", SLOT_COUNT);
-        private static Shelf shelfB = new Shelf("B", SLOT_COUNT);
+        private static int _playerHp = MaxHp;
+        private static int _enemyHp = MaxHp;
+        private static int _round = 1;
 
-        private static Journal<PlacedEvent> placedJournal = new Journal<PlacedEvent>();
-        private static Journal<TakenEvent> takenJournal = new Journal<TakenEvent>();
-        private static Journal<MovedEvent> movedJournal = new Journal<MovedEvent>();
-        private static Journal<FailedAttemptEvent> failedJournal = new Journal<FailedAttemptEvent>();
+        private static IEnemyAttackStrategy _enemyStrategy;
+        private static bool _hasSwitchedToCareful = false;
+        private static bool _hasSwitchedToRandom = false;
+
+        private static readonly LightPlayerAttackStrategy _lightStrategy = new LightPlayerAttackStrategy();
+        private static readonly HeavyPlayerAttackStrategy _heavyStrategy = new HeavyPlayerAttackStrategy(12, PlayerStrength, 2);
+
+        private static readonly PlayerDamagePipeline _pipeline = new PlayerDamagePipeline();
 
         static void Main(string[] args)
         {
-            LoadJournals();
+            _pipeline.Modifiers += PlayerDamagePipeline.ApplyBonusIfEnemyLow;
+            _pipeline.Modifiers += PlayerDamagePipeline.ApplyPenaltyIfPlayerLow;
+
+            _enemyStrategy = new AggressiveEnemyStrategy();
 
             bool exit = false;
 
             while (!exit)
             {
-                DisplayShelves();
-                ShowMenu();
+                DisplayStateAndMenu();
 
-                int choice = ReadIntFromUser(1, 5, "Ваш выбор: ");
+                int choice = ReadIntInput(0, 4, "Ваш выбор: ");
 
-                switch (choice)
+                if (choice == 0)
                 {
-                    case 1:
-                        PutProduct();
-                        break;
-                    case 2:
-                        TakeProduct();
-                        break;
-                    case 3:
-                        MoveProduct();
-                        break;
-                    case 4:
-                        ShowJournals();
-                        break;
-                    case 5:
-                        SaveJournals();
-                        Console.WriteLine("Сохранение журналов выполнено. пока");
-                        exit = true;
-                        break;
+                    exit = true;
+                    continue;
+                }
+
+                if (choice == 4)
+                {
+                    ShowStateOnly();
+                    continue;
+                }
+
+                bool playerAlive = ProcessPlayerTurn(choice);
+                if (!playerAlive) break;
+
+                if (_enemyHp <= 0)
+                {
+                    Console.WriteLine("\nПоздравляем! Вы победили!\n");
+                    break;
+                }
+
+                UpdateEnemyStrategy();
+
+                bool enemyAlive = ProcessEnemyTurn();
+                if (!enemyAlive) break;
+
+                if (_playerHp <= 0)
+                {
+                    Console.WriteLine("\nПротивник победил! Game over.\n");
+                    break;
+                }
+
+                _round++;
+            }
+
+            Console.WriteLine("Игра завершена. Нажмите любую клавишу для выхода...");
+            Console.ReadKey();
+        }
+
+        private static void DisplayStateAndMenu()
+        {
+            string strategyName = GetEnemyStrategyName();
+            Console.WriteLine($"\n--- Раунд {_round} | Игрок {_playerHp} HP | Сила {PlayerStrength} | Противник {_enemyHp} HP | Стратегия: {strategyName} ---");
+            Console.WriteLine("1 - Лёгкий удар");
+            Console.WriteLine("2 - Тяжёлый удар");
+            Console.WriteLine("3 - Отдых");
+            Console.WriteLine("4 - Показать состояние");
+            Console.WriteLine("0 - Выход");
+        }
+
+        private static void ShowStateOnly()
+        {
+            string strategyName = GetEnemyStrategyName();
+            Console.WriteLine($"Игрок: {_playerHp} HP | Противник: {_enemyHp} HP | Сила: {PlayerStrength} | Раунд: {_round} | Стратегия: {strategyName}");
+        }
+
+        private static bool ProcessPlayerTurn(int choice)
+        {
+            int damage = 0;
+            string attackType = "";
+
+            if (choice == 1)
+            {
+                damage = _lightStrategy.GetPlayerDamage(_round, _playerHp, _enemyHp);
+                attackType = "лёгкий удар";
+            }
+            else if (choice == 2)
+            {
+                damage = _heavyStrategy.GetPlayerDamage(_round, _playerHp, _enemyHp);
+                attackType = $"тяжёлый удар (база 12 + Сила×2 = {damage})";
+            }
+            else if (choice == 3)
+            {
+                _playerHp += 5;
+                if (_playerHp > MaxHp)
+                    _playerHp = MaxHp;
+                Console.WriteLine("Игрок отдыхает и восстанавливает 5 HP.");
+                return true;
+            }
+
+            if (choice == 1 || choice == 2)
+            {
+                int enemyHpBefore = _enemyHp;
+                DamageContext context = new DamageContext(_round, enemyHpBefore, _playerHp, PlayerStrength);
+                _pipeline.Apply(ref damage, context);
+
+                _enemyHp -= damage;
+                if (_enemyHp < 0) _enemyHp = 0;
+
+                Console.WriteLine($"Игрок наносит {attackType}.");
+
+                if (context.EnemyHpBeforeHit < 30 || context.PlayerHp < 40)
+                {
+                    Console.WriteLine($"  (После модификаторов урон составил {damage})");
                 }
             }
+
+            return true;
         }
 
-        private static void LoadJournals()
+        private static bool ProcessEnemyTurn()
         {
-            placedJournal.LoadFromFile("placed.log", PlacedEvent.FromLogLine);
-            takenJournal.LoadFromFile("taken.log", TakenEvent.FromLogLine);
-            movedJournal.LoadFromFile("moved.log", MovedEvent.FromLogLine);
-            failedJournal.LoadFromFile("failed.log", FailedAttemptEvent.FromLogLine);
+            int damage = _enemyStrategy.GetEnemyDamage(_round, _enemyHp, _playerHp);
+            _playerHp -= damage;
+            if (_playerHp < 0) _playerHp = 0;
 
-            RestoreShelvesFromJournals();
-
-            Console.WriteLine("Журналы загружены из файлов (или пусто, если первый запуск).");
+            Console.WriteLine($"Противник наносит {damage} урона.");
+            return true;
         }
 
-        private static void RestoreShelvesFromJournals()
+        private static void UpdateEnemyStrategy()
         {
-            for (int i = 1; i <= SLOT_COUNT; i++)
+            if (!_hasSwitchedToRandom && _enemyHp < 25)
             {
-                try { shelfA.TakeProduct(i); } catch { }
-                try { shelfB.TakeProduct(i); } catch { }
+                _enemyStrategy = new RandomEnemyStrategy();
+                _hasSwitchedToRandom = true;
+                _hasSwitchedToCareful = true; 
+                Console.WriteLine("  (Противник меняет стратегию на Random!)");
             }
-
-            var allPlaceEvents = new List<(DateTime time, string shelf, int slot, string product)>();
-            foreach (var e in placedJournal.GetAll())
+            else if (!_hasSwitchedToCareful && _enemyHp < 50)
             {
-                allPlaceEvents.Add((e.Time, e.Shelf, e.Slot, e.ProductName));
-            }
-
-            allPlaceEvents.Sort((a, b) => a.time.CompareTo(b.time));
-
-            foreach (var ev in allPlaceEvents)
-            {
-                Shelf targetShelf = ev.shelf == "A" ? shelfA : shelfB;
-                try
-                {
-                    targetShelf.PutProduct(ev.slot, ev.product);
-                }
-                catch { }
-            }
-
-            foreach (var e in takenJournal.GetAll())
-            {
-                Shelf targetShelf = e.Shelf == "A" ? shelfA : shelfB;
-                try
-                {
-                    targetShelf.TakeProduct(e.Slot);
-                }
-                catch { }
-            }
-
-            foreach (var e in movedJournal.GetAll())
-            {
-                Shelf fromShelf = e.FromShelf == "A" ? shelfA : shelfB;
-                Shelf toShelf = e.ToShelf == "A" ? shelfA : shelfB;
-                try
-                {
-                    string product = fromShelf.TakeProduct(e.FromSlot);
-                    toShelf.PutProduct(e.ToSlot, product);
-                }
-                catch { }
+                _enemyStrategy = new CarefulEnemyStrategy();
+                _hasSwitchedToCareful = true;
+                Console.WriteLine("  (Противник меняет стратегию на Careful!)");
             }
         }
 
-        private static void SaveJournals()
+        private static string GetEnemyStrategyName()
         {
-            placedJournal.SaveToFile("placed.log");
-            takenJournal.SaveToFile("taken.log");
-            movedJournal.SaveToFile("moved.log");
-            failedJournal.SaveToFile("failed.log");
+            if (_enemyStrategy is AggressiveEnemyStrategy)
+                return "Aggressive";
+            if (_enemyStrategy is CarefulEnemyStrategy)
+                return "Careful";
+            if (_enemyStrategy is RandomEnemyStrategy)
+                return "Random";
+            return "Unknown";
         }
 
-        private static void DisplayShelves()
-        {
-            Console.WriteLine("\n=== Склад ===");
-            shelfA.Display();
-            shelfB.Display();
-            Console.WriteLine();
-        }
-
-        private static void ShowMenu()
-        {
-            Console.WriteLine("1 - Положить товар");
-            Console.WriteLine("2 - Забрать товар");
-            Console.WriteLine("3 - Перенести товар");
-            Console.WriteLine("4 - Показать журналы");
-            Console.WriteLine("5 - Выход");
-        }
-
-        private static int ReadIntFromUser(int min, int max, string prompt)
+        private static int ReadIntInput(int min, int max, string prompt)
         {
             while (true)
             {
@@ -146,128 +181,8 @@ namespace second_dz
                 string input = Console.ReadLine();
                 if (int.TryParse(input, out int result) && result >= min && result <= max)
                     return result;
-                Console.WriteLine($"Введите число от {min} до {max}.");
+                Console.WriteLine("Неверный ввод");
             }
-        }
-
-        private static string ReadShelfLetter(string prompt)
-        {
-            while (true)
-            {
-                Console.Write(prompt);
-                string input = Console.ReadLine()?.ToUpper();
-                if (input == "A" || input == "B")
-                    return input;
-                Console.WriteLine("Введите A или B.");
-            }
-        }
-
-        private static string ReadNonEmptyString(string prompt)
-        {
-            while (true)
-            {
-                Console.Write(prompt);
-                string input = Console.ReadLine()?.Trim();
-                if (!string.IsNullOrEmpty(input))
-                    return input;
-                Console.WriteLine("Название товара не может быть пустым.");
-            }
-        }
-
-        private static void PutProduct()
-        {
-            string shelfLetter = ReadShelfLetter("Полка (A или B): ");
-            int slot = ReadIntFromUser(1, SLOT_COUNT, "Номер слота (1-5): ");
-            string productName = ReadNonEmptyString("Название товара: ");
-
-            Shelf shelf = shelfLetter == "A" ? shelfA : shelfB;
-
-            if (!shelf.IsSlotEmpty(slot))
-            {
-                string product = shelf.GetProduct(slot);
-                string errorMsg = product == null ? "слот занят" : $"слот уже занят товаром «{product}»";
-                Console.WriteLine($"Нельзя положить: {errorMsg}");
-                failedJournal.Add(new FailedAttemptEvent("Положить", shelfLetter, slot, errorMsg));
-                return;
-            }
-
-            shelf.PutProduct(slot, productName);
-            placedJournal.Add(new PlacedEvent(shelfLetter, slot, productName));
-            Console.WriteLine("Операция выполнена.");
-        }
-
-        private static void TakeProduct()
-        {
-            string shelfLetter = ReadShelfLetter("Полка (A или B): ");
-            int slot = ReadIntFromUser(1, SLOT_COUNT, "Номер слота (1-5): ");
-
-            Shelf shelf = shelfLetter == "A" ? shelfA : shelfB;
-
-            if (shelf.IsSlotEmpty(slot))
-            {
-                string errorMsg = "слот пуст";
-                Console.WriteLine($"Нельзя забрать: {errorMsg}");
-                failedJournal.Add(new FailedAttemptEvent("Забрать", shelfLetter, slot, errorMsg));
-                return;
-            }
-
-            string product = shelf.TakeProduct(slot);
-            takenJournal.Add(new TakenEvent(shelfLetter, slot, product));
-            Console.WriteLine($"Забран товар: {product}");
-        }
-
-        private static void MoveProduct()
-        {
-            string fromShelfLetter = ReadShelfLetter("Полка-источник (A или B): ");
-            int fromSlot = ReadIntFromUser(1, SLOT_COUNT, "Слот-источник (1-5): ");
-            string toShelfLetter = ReadShelfLetter("Полка-назначение (A или B): ");
-            int toSlot = ReadIntFromUser(1, SLOT_COUNT, "Слот-назначение (1-5): ");
-
-            Shelf fromShelf = fromShelfLetter == "A" ? shelfA : shelfB;
-            Shelf toShelf = toShelfLetter == "A" ? shelfA : shelfB;
-
-            if (fromShelf.IsSlotEmpty(fromSlot))
-            {
-                string errorMsg = "слот-источник пуст";
-                Console.WriteLine($"Нельзя перенести: {errorMsg}");
-                failedJournal.Add(new FailedAttemptEvent("Перенести", fromShelfLetter, fromSlot, errorMsg));
-                return;
-            }
-
-            if (!toShelf.IsSlotEmpty(toSlot))
-            {
-                string product = toShelf.GetProduct(toSlot);
-                string errorMsg = product == null ? "слот-назначение занят" : $"слот-назначение уже занят товаром «{product}»";
-                Console.WriteLine($"Нельзя перенести: {errorMsg}");
-                failedJournal.Add(new FailedAttemptEvent("Перенести", toShelfLetter, toSlot, errorMsg));
-                return;
-            }
-
-            string movedProduct = fromShelf.TakeProduct(fromSlot);
-            toShelf.PutProduct(toSlot, movedProduct);
-            movedJournal.Add(new MovedEvent(fromShelfLetter, fromSlot, toShelfLetter, toSlot, movedProduct));
-            Console.WriteLine($"Операция выполнена. Перенесён товар: {movedProduct}");
-        }
-
-        private static void ShowJournals()
-        {
-            Console.WriteLine("\n--- Размещения ---");
-            foreach (var e in placedJournal.GetAll())
-                Console.WriteLine(e.ToScreenLine());
-
-            Console.WriteLine("\n--- Изъятия ---");
-            foreach (var e in takenJournal.GetAll())
-                Console.WriteLine(e.ToScreenLine());
-
-            Console.WriteLine("\n--- Переносы ---");
-            foreach (var e in movedJournal.GetAll())
-                Console.WriteLine(e.ToScreenLine());
-
-            Console.WriteLine("\n--- Неуспешные попытки ---");
-            foreach (var e in failedJournal.GetAll())
-                Console.WriteLine(e.ToScreenLine());
-
-            Console.WriteLine();
         }
     }
 }
